@@ -6,8 +6,9 @@ const { getUser, updateUser } = require('./storage');
 const { getConversationReply, getFeedback } = require('./claudeClient');
 const { SCENARIOS, LEVELS } = require('./scenarios');
 const { transcribeVoice, synthesizeSpeech, convertMp3ToOgg } = require('./audioClient');
+const { hasAccess, trialDaysLeft, buildInvoicePayload, SUBSCRIPTION_DAYS } = require('./payments');
 
-function createBot(telegramToken, anthropicKey, openaiKey) {
+function createBot(telegramToken, anthropicKey, openaiKey, paymentProviderToken) {
   const bot = new TelegramBot(telegramToken, { polling: true });
 
   // Регистрируем команды, чтобы они появлялись в меню Telegram (кнопка "/" или "Menu")
@@ -17,8 +18,84 @@ function createBot(telegramToken, anthropicKey, openaiKey) {
     { command: 'level', description: 'Сменить уровень сложности' },
     { command: 'scenario', description: 'Сменить тему диалога' },
     { command: 'mode', description: 'Ответ бота: текстом или голосом' },
+    { command: 'subscribe', description: 'Оплатить подписку' },
     { command: 'stats', description: 'Посмотреть свой прогресс' }
   ]);
+
+  // ===== Команда /subscribe — показать карточку подписки с ценой и кнопкой оформления =====
+  bot.onText(/\/subscribe/, async (msg) => {
+    const chatId = msg.chat.id;
+    const user = getUser(chatId);
+
+    if (user.subscriptionUntil && user.subscriptionUntil > Date.now()) {
+      const untilDate = new Date(user.subscriptionUntil).toLocaleDateString('ru-RU');
+      bot.sendMessage(chatId, `У тебя уже активна подписка до ${untilDate} 🎉`);
+      return;
+    }
+
+    sendSubscriptionCard(chatId);
+  });
+
+  function sendSubscriptionCard(chatId) {
+    const invoice = buildInvoicePayload();
+    const priceRub = (invoice.prices[0].amount / 100).toFixed(0);
+
+    bot.sendMessage(
+      chatId,
+      `💳 *Подписка на языкового бота*\n\n` +
+      `${invoice.description}\n\n` +
+      `Цена: *${priceRub} ₽ / 30 дней*`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[{ text: `Оформить подписку — ${priceRub} ₽`, callback_data: 'order_subscribe' }]]
+        }
+      }
+    );
+  }
+
+  // Нажатие на кнопку "Оформить подписку" в карточке
+  async function handleOrderSubscribe(chatId) {
+    if (!paymentProviderToken) {
+      bot.sendMessage(
+        chatId,
+        'Оплата пока готовится к подключению — скоро здесь появится возможность оплатить прямо в боте 🙏'
+      );
+      return;
+    }
+
+    const invoice = buildInvoicePayload();
+    await bot.sendInvoice(
+      chatId,
+      invoice.title,
+      invoice.description,
+      invoice.payload,
+      paymentProviderToken,
+      invoice.currency,
+      invoice.prices
+    );
+  }
+
+  // Telegram спрашивает подтверждение перед оплатой — отвечаем "всё ок"
+  bot.on('pre_checkout_query', (query) => {
+    bot.answerPreCheckoutQuery(query.id, true);
+  });
+
+  // Успешная оплата — продлеваем подписку
+  bot.on('message', (msg) => {
+    if (!msg.successful_payment) return;
+    const chatId = msg.chat.id;
+    const user = getUser(chatId);
+
+    const now = Date.now();
+    // Если подписка уже была активна — продлеваем от даты её окончания, а не от "сейчас"
+    const base = user.subscriptionUntil && user.subscriptionUntil > now ? user.subscriptionUntil : now;
+    const newUntil = base + SUBSCRIPTION_DAYS * 24 * 60 * 60 * 1000;
+
+    updateUser(chatId, { subscriptionUntil: newUntil });
+    const untilDate = new Date(newUntil).toLocaleDateString('ru-RU');
+    bot.sendMessage(chatId, `Оплата прошла успешно! ✅ Подписка активна до ${untilDate}. Спасибо! 🎉`);
+  });
 
   // ===== Команда /start =====
   bot.onText(/\/start/, (msg) => {
@@ -62,12 +139,24 @@ function createBot(telegramToken, anthropicKey, openaiKey) {
   bot.onText(/\/stats/, (msg) => {
     const chatId = msg.chat.id;
     const user = getUser(chatId);
+
+    let accessLine;
+    if (user.subscriptionUntil && user.subscriptionUntil > Date.now()) {
+      accessLine = `Подписка активна до ${new Date(user.subscriptionUntil).toLocaleDateString('ru-RU')} ✅`;
+    } else {
+      const daysLeft = trialDaysLeft(user);
+      accessLine = daysLeft > 0
+        ? `Пробный период: осталось ${daysLeft} дн.`
+        : 'Пробный период закончился — оформи /subscribe';
+    }
+
     bot.sendMessage(
       chatId,
       `📊 Твой прогресс:\nЯзык: ${user.language || 'не выбран'}\n` +
       `Уровень: ${user.level || 'не выбран'}\n` +
       `Режим ответа бота: ${user.responseMode === 'voice' ? 'голосом 🔊' : 'текстом 💬'}\n` +
-      `Сессий практики: ${user.sessionsCount}`
+      `Сессий практики: ${user.sessionsCount}\n` +
+      `${accessLine}`
     );
   });
 
@@ -139,9 +228,11 @@ function createBot(telegramToken, anthropicKey, openaiKey) {
           : 'Готово, теперь буду отвечать текстом 💬'
       );
     }
+    if (data === 'order_subscribe') {
+      await bot.answerCallbackQuery(query.id);
+      await handleOrderSubscribe(chatId);
+    }
   });
-
-  // ===== Общая логика: получить от Claude ответ + разбор ошибок, обновить историю =====
   async function processUserText(chatId, user, userText) {
     const reply = await getConversationReply(
       anthropicKey,
@@ -212,6 +303,14 @@ function createBot(telegramToken, anthropicKey, openaiKey) {
       return;
     }
 
+    if (!hasAccess(user)) {
+      bot.sendMessage(
+        chatId,
+        'Пробный период закончился 😔 Чтобы продолжить практику — оформи подписку командой /subscribe'
+      );
+      return;
+    }
+
     try {
       bot.sendChatAction(chatId, 'typing');
       const { reply, feedback } = await processUserText(chatId, user, msg.text);
@@ -233,6 +332,14 @@ function createBot(telegramToken, anthropicKey, openaiKey) {
 
     if (!user.language || !user.scenario) {
       bot.sendMessage(chatId, 'Сначала настрой язык и тему через /start.');
+      return;
+    }
+
+    if (!hasAccess(user)) {
+      bot.sendMessage(
+        chatId,
+        'Пробный период закончился 😔 Чтобы продолжить практику — оформи подписку командой /subscribe'
+      );
       return;
     }
 
