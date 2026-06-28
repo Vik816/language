@@ -39,8 +39,15 @@ function getUser(chatId) {
       responseMode: 'text',  // как бот отвечает: 'text' или 'voice'
       history: [],           // история сообщений для контекста диалога
       sessionsCount: 0,      // сколько раз попрактиковался
+      trialStartedAt: Date.now(),  // когда начался пробный период
+      subscriptionUntil: null,     // до какой даты активна подписка (timestamp), null если нет
       createdAt: new Date().toISOString()
     };
+    saveAll(all);
+  } else if (!all[key].trialStartedAt) {
+    // Пользователь создан до введения подписок — даём ему честный пробный период с этого момента
+    all[key].trialStartedAt = Date.now();
+    if (all[key].subscriptionUntil === undefined) all[key].subscriptionUntil = null;
     saveAll(all);
   }
   return all[key];
